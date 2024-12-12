@@ -1,0 +1,557 @@
+---
+title: "MSADS 502 Final Project Code"
+author: "Tommy"
+date: "2024-12-07"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, include=FALSE}
+library(lubridate)
+library(dplyr)
+library(ggplot2)
+library(car)
+library(MLmetrics)
+library(rpart)
+library(rpart.plot)
+library(C50)
+library(zoo)
+library(randomForest)
+library(nnet)
+library(NeuralNetTools)
+library(e1071)
+library(pROC)
+library(ggcorrplot)
+library(tidyr)
+library(psych)
+```
+
+Upload data and check for N/A values
+
+```{r}
+df <- read.csv("us_stock_data.csv")
+head(df)
+colSums(is.na(df))
+```
+
+# Data Pre-processing
+
+## Reformat date using lubridate package
+
+```{r}
+df$standardized_dates <- parse_date_time(df$Date, orders = c("dmy"))
+df$standardized_dates <- as.Date(df$standardized_dates)
+head(df)
+```
+
+We will be focusing on predicting Bitcoin Price Movement using individual stocks
+
+Individual stocks: Apple, Tesla, Microsoft, Google, Nvidia, Berkshire Hathaway, Netflix, Amazon, and Meta
+
+```{r}
+# Create filtered data frame with individual stocks and dates
+
+filtered_df <- df[, c("standardized_dates", "Bitcoin_Price", "Apple_Price", "Tesla_Price", "Microsoft_Price", "Google_Price", "Nvidia_Price", "Berkshire_Price", "Netflix_Price", "Amazon_Price", "Meta_Price")]
+
+filtered_df$Bitcoin_Price <- gsub("[^0-9.-]", "", filtered_df$Bitcoin_Price)
+filtered_df$Bitcoin_Price <- as.numeric(filtered_df$Bitcoin_Price)
+filtered_df$Berkshire_Price <- gsub("[^0-9.-]", "", filtered_df$Berkshire_Price)
+filtered_df$Berkshire_Price <- as.numeric(filtered_df$Berkshire_Price)
+head(filtered_df)
+
+# Sort the filtered data frame by date
+
+sorted_filtered_df <- filtered_df[order(filtered_df$standardized_dates, decreasing = TRUE),]
+head(sorted_filtered_df)
+```
+
+## Partition the Data into Test (25%) and Train (75%)
+
+```{r}
+split_point <- floor(0.25 * nrow(sorted_filtered_df))
+
+test_data <- sorted_filtered_df[1:split_point,]
+train_data <- sorted_filtered_df[(split_point + 1):nrow(sorted_filtered_df), ]
+
+n_test <- dim(test_data)[1]
+test_data$Index <- c(1:n_test)
+n_train <- dim(train_data)[1]
+train_data$Index <- c(1:n_train)
+
+# Uncomment to check the test and train data
+
+## Train data information:
+## 760 Data points from 2020-01-02 to 2023-01-31
+
+## Test data information:
+## 253 Data points from 2023-02-01 to 2024-02-02
+
+head(train_data)
+head(test_data)
+```
+
+## Create Test & Train sets that have standardized variables
+
+```{r}
+# Standardize the variables into a new data frame
+
+std_sorted_filtered_df <- sorted_filtered_df
+std_sorted_filtered_df[, 2:11] <- scale(sorted_filtered_df[, 2:11])
+
+# Split the new standardized data frame into the train and test sets
+
+std_split_point <- floor(0.25 * nrow(std_sorted_filtered_df))
+
+std_test <- std_sorted_filtered_df[1:std_split_point,]
+std_train <- std_sorted_filtered_df[(split_point + 1):nrow(std_sorted_filtered_df),]
+
+# Create Index for the train and test sets
+
+n_test <- dim(std_test)[1]
+std_test$Index <- c(1:n_test)
+n_train <- dim(std_train)[1]
+std_train$Index <- c(1:n_train)
+
+# For time series analysis lag the target variable by one day to use previous day predictor variables to predict the movement of next day target variable
+
+std_train$Bitcoin_Lag <- lag(std_train$Bitcoin_Price, 1)
+std_test$Bitcoin_Lag <- lag(std_test$Bitcoin_Price, 1)
+
+## Create a seven day rolling mean for the target variable
+
+std_train <- std_train %>%
+  mutate(var1_7day_avg = rollmean(Bitcoin_Price, k=7, fill = NA, align = "right"))
+std_test <- std_test %>%
+  mutate(var2_7day_avg = rollmean(Bitcoin_Price, k=7, fill = NA, align = "right"))
+
+## Use the seven day rolling mean to see if the predictor variable increases or decreases
+
+std_train <- std_train %>%
+  mutate(Bitcoin_Price_Change = ifelse(var1_7day_avg > lag(var1_7day_avg), "Increased",
+                                       ifelse(var1_7day_avg < lag(var1_7day_avg), "Decreased", "No Change")))
+std_test <- std_test %>%
+  mutate(Bitcoin_Price_Change = ifelse(var2_7day_avg > lag(var2_7day_avg), "Increased",
+                                ifelse(var2_7day_avg < lag(var2_7day_avg), "Decreased", "No Change")))
+
+std_train$Bitcoin_Price_Change <- factor(std_train$Bitcoin_Price_Change)
+std_test$Bitcoin_Price_Change <- factor(std_test$Bitcoin_Price_Change)
+
+std_train <- na.omit(std_train)
+std_test <- na.omit(std_test)
+
+head(std_train)
+head(std_test)
+
+table(std_train$Bitcoin_Price_Change)
+table(std_test$Bitcoin_Price_Change)
+```
+
+# Exploratory Data Analysis
+
+## Overlapping Line Graph with Stock Prices
+
+Note: Berkshire_Price was not graphed because it has extreme values
+
+```{r}
+plot(train_data$standardized_dates, train_data$Apple_Price, type = "l", col = "#648fff", lwd = 3, xlab = "Dates over time", ylab = "Stock Prices", main = "Stock Prices Over Time From Jan 2020 to Jan 2023", ylim = c(0, 750))
+lines(train_data$standardized_dates, train_data$Tesla_Price, col = "#785ef0", lwd = 3)
+lines(train_data$standardized_dates, train_data$Microsoft_Price, col = "#dc267f", lwd = 3)
+lines(train_data$standardized_dates, train_data$Google_Price, col = "#fe6100", lwd = 3)
+lines(train_data$standardized_dates, train_data$Nvidia_Price, col = "#ffb000", lwd = 3)
+# lines(train_data$standardized_dates, train_data$Berkshire_Price, col = "#785ef0", lwd = 2)
+lines(train_data$standardized_dates, train_data$Netflix_Price, col = "#882255", lwd = 3)
+lines(train_data$standardized_dates, train_data$Amazon_Price, col = "#0072b2", lwd = 3)
+lines(train_data$standardized_dates, train_data$Meta_Price, col = "#117733", lwd = 3)
+legend("topright", legend = c("Apple", "Tesla", "Microsoft", "Google", "Nvidia", "Netflix", "Amazon", "Meta"),col = c("#648fff", "#785ef0", "#dc267f", "#fe6100", "#ffb000", "#882255", "#0072b2", "#117733"), lwd = 10, cex = 0.65)
+```
+
+## Overlapping Line Graph with Standardized Stock Prices (Berkshire Included)
+
+```{r}
+plot(std_train$standardized_dates, std_train$Apple_Price, type = "l", col = "#648fff", lwd = 3, xlab = "Dates over time", ylab = "Stock Prices", main = "Stock Prices Over Time From Jan 2020 to Jan 2023", ylim = c(-3,3))
+lines(std_train$standardized_dates, std_train$Tesla_Price, col = "#785ef0", lwd = 3)
+lines(std_train$standardized_dates, std_train$Microsoft_Price, col = "#dc267f", lwd = 3)
+lines(std_train$standardized_dates, std_train$Google_Price, col = "#fe6100", lwd = 3)
+lines(std_train$standardized_dates, std_train$Nvidia_Price, col = "#ffb000", lwd = 3)
+lines(std_train$standardized_dates, std_train$Berkshire_Price, col = "#000000", lwd = 2)
+lines(std_train$standardized_dates, std_train$Netflix_Price, col = "#882255", lwd = 3)
+lines(std_train$standardized_dates, std_train$Amazon_Price, col = "#0072b2", lwd = 3)
+lines(std_train$standardized_dates, std_train$Meta_Price, col = "#117733", lwd = 3)
+legend("topright", legend = c("Apple", "Tesla", "Microsoft", "Google", "Nvidia", "Berkshire", "Netflix", "Amazon", "Meta"),col = c("#648fff", "#785ef0", "#dc267f", "#fe6100", "#ffb000", "#000000", "#882255", "#0072b2", "#117733"), lwd = 10, cex = 0.65)
+```
+
+## Overlapping Line Graph with Only Apple, Bitcoin, Microsoft, and Tesla
+
+```{r}
+# Convert wide data to long format for visualization
+std_train_long <- std_train %>%
+  pivot_longer(
+    cols = c(Bitcoin_Price, Apple_Price, Tesla_Price, Microsoft_Price, 
+    ), 
+    names_to = "Stock", 
+    values_to = "Price"
+  )
+
+# Create line plots for all stocks and Bitcoin price over time
+ggplot(std_train_long, aes(x = standardized_dates, y = Price, color = Stock)) +
+  geom_line() +
+  labs(title = "Stock and Bitcoin Price Trends Over Time",
+       x = "Date",
+       y = "Price",
+       color = "Stock") +
+  theme_minimal()
+```
+
+## Overlapping Line Graph with Only Berkshire, Bitcoin, Google, and Nvidia
+
+```{r}
+long_data <- std_train %>%
+  pivot_longer(cols = c(Bitcoin_Price, Google_Price, Nvidia_Price, Berkshire_Price), 
+               names_to = "Stock", values_to = "Price")
+
+ggplot(long_data, aes(x = standardized_dates, y = Price, color = Stock)) +
+  geom_line() +
+  labs(title = "Price Trends Over Time", x = "Date", y = "Price") +
+  theme_minimal()
+```
+
+## Overlapping Line Graph with Only Amazon, Bitcoin, Meta, and Netflix
+
+```{r}
+long_data <- std_train %>%
+  pivot_longer(cols = c(Bitcoin_Price, Netflix_Price, 
+                        Amazon_Price, Meta_Price), 
+               names_to = "Stock", values_to = "Price")
+
+ggplot(long_data, aes(x = standardized_dates, y = Price, color = Stock)) +
+  geom_line() +
+  labs(title = "Price Trends Over Time", x = "Date", y = "Price") +
+  theme_minimal()
+```
+
+## Correlation Heat Map of all Variables
+
+```{r}
+#Correlation Analysis
+#Explore the correlation between Bitcoin's price and the prices of individual stocks
+
+correlation_matrix <- cor(train_data[, 2:11], use = "complete.obs")
+print(correlation_matrix)
+
+# Heatmap of correlations
+ggcorrplot(correlation_matrix, lab = TRUE)
+```
+
+```{r}
+#Seasonality or Temporal Trends
+#Check if there are any temporal patterns in Bitcoin price changes
+
+ggplot(std_train, aes(x = month(standardized_dates), fill = Bitcoin_Price_Change)) +
+  geom_bar() +
+  labs(title = "Bitcoin Price Change by Month", x = "Month", y = "Frequency") +
+  theme_minimal()
+```
+
+# Model building
+
+## Logistic Regression Model Based on Stock Prices
+
+Accuracy: (39 + 81)/246 = 0.4878
+Error Rate: 1 - 0.4878 = 0.5122
+Sensitivity: 81/113 = 0.7168
+Specificity: 39/133 = 0.3451
+Precision: 81/175 = 0.4629
+F1: (2)(0.4629)(0.7168)/(0.4629 + 0.7168) = 0.5625
+F2: (5)(0.4629)(0.7168)/((4)(0.4629) + 0.7168) = 0.6459
+F0.5: (1.25)(0.4629)(0.7168)/((0.25)(0.4629) + 0.7168) = 0.4982
+
+```{r}
+lrs01_model <- glm(formula = Bitcoin_Price_Change ~ Apple_Price + Tesla_Price + Microsoft_Price + Google_Price + Nvidia_Price + Berkshire_Price + Netflix_Price + Amazon_Price + Meta_Price, data = std_train, family = binomial)
+summary(lrs01_model)
+print("Predictor Variable Multicollinearity:")
+
+ypred <- predict(object = lrs01_model, newdata = std_test, type = "response")
+predicted_classes <- ifelse(ypred > 0.7, 1, 0)
+
+# Contingency Table
+
+t1 <- table(std_test$Bitcoin_Price_Change, predicted_classes)
+row.names(t1) <- c("Actual: Decrease", "Actual: Increase")
+colnames(t1) <- c("Predicted: Decrease", "Predicted: Increase")
+t1 <- addmargins(A = t1, FUN = list(Total = sum), quiet = TRUE)
+t1
+
+# Logistic Regression AUC score
+
+lrs01_actual <- (std_test$Bitcoin_Price_Change == "Increased")
+lrs01_roc <- roc(lrs01_actual, predicted_classes)
+lrs01_auc <- auc(lrs01_roc)
+lrs01_auc
+```
+
+## Logistic Regression Model with Removed Predictor Variables
+
+Accuracy: (23 + 100)/246 = 0.5000
+Error Rate: 1 - 0.5000 = 0.5000
+Sensitivity: 100/113 = 0.8850
+Specificity: 23/133 = 0.1729
+Precision: 100/210 = 0.4762
+F1: (2)(0.4762)(0.8850)/(0.4762 + 0.8850) = 0.6192
+F2: (5)(0.4762)(0.8850)/((4)(0.4762) + 0.8850) = 0.7553
+F0.5: (1.25)(0.4762)(0.8850)/((0.25)(0.4762) + 0.8850) = 0.5247
+
+```{r}
+lrs02_model <- glm(formula = Bitcoin_Price_Change ~ Apple_Price + Tesla_Price + Microsoft_Price + Google_Price + Berkshire_Price, data = std_train, family = binomial)
+summary(lrs02_model)
+print("Predictor Variable Multicollinearity:")
+vif(lrs02_model)
+
+ypred <- predict(object = lrs02_model, newdata = std_test, type = "response")
+predicted_classes <- ifelse(ypred > 0.5, 1, 0)
+
+# Contingency Table
+
+t2 <- table(std_test$Bitcoin_Price_Change, predicted_classes)
+row.names(t2) <- c("Actual: Decrease", "Actual: Increase")
+colnames(t2) <- c("Predicted: Decrease", "Predicted: Increase")
+t2 <- addmargins(A = t2, FUN = list(Total = sum), quiet = TRUE)
+t2
+
+# Logistic Regression AUC score
+
+lrs02_actual <- (std_test$Bitcoin_Price_Change == "Increased")
+lrs02_roc <- roc(lrs02_actual, predicted_classes)
+lrs02_auc <- auc(lrs02_roc)
+lrs02_auc
+```
+
+## CART
+
+Accuracy: (83 + 55)/246 = 0.5610
+Error Rate: 1 - 0.5610 = 0.4390
+Sensitivity: 55/113 = 0.4867
+Specificity: 83/133 = 0.6241
+Precision: 55/105 = 0.5238
+F1: (2)(0.5238)(0.4867)/(0.5238 + 0.4867) = 0.5046
+F2: (5)(0.5238)(0.4867)/((4)(0.5238) + 0.4867) = 0.4937
+F0.5: (1.25)(0.5238)(0.4867)/((0.25)(0.5238) + 0.4867) = 0.5159
+
+```{r}
+cart01_model <- rpart(formula = Bitcoin_Price_Change ~ Apple_Price + Tesla_Price + Microsoft_Price + Google_Price + Nvidia_Price + Berkshire_Price + Netflix_Price + Amazon_Price + Meta_Price, data = std_train, method = "class")
+
+rpart.plot(cart01_model)
+
+ypred <- predict(object = cart01_model, newdata = std_test, type = "class")
+# predicted_class <- ifelse(ypred[, 2] > 0.5, 1, 0)
+
+# Contingency Table
+
+t1 <- table(std_test$Bitcoin_Price_Change, ypred)
+row.names(t1) <- c("Actual: Decrease", "Actual: Increase")
+colnames(t1) <- c("Predicted: Decrease", "Predicted: Increase")
+t1 <- addmargins(A = t1, FUN = list(Total = sum), quiet = TRUE)
+t1
+
+# Node counts
+
+total_nodes <- length(cart01_model$frame$var)
+total_nodes
+leaf_nodes <- sum(cart01_model$frame$var == "<leaf>")
+leaf_nodes
+decision_nodes <- total_nodes - leaf_nodes
+decision_nodes
+
+# Information regarding the CART model CP score
+
+# summary(cart01_model)$splits
+```
+
+## Pruned CART Model
+
+Accuracy: (74 + 64)/246 = 0.5610
+Error Rate: 1 - 0.5610 = 0.4390
+Sensitivity: 64/113 = 0.5664
+Specificity: 74/133 = 0.5564
+Precision: 64/123 = 0.5203
+F1: (2)(0.5203)(0.5664)/(0.5203 + 0.5664) = 0.5424
+F2: (5)(0.5203)(0.5664)/((4)(0.5203) + 0.5664) = 0.5565
+F0.5: (1.25)(0.5203)(0.5664)/((0.25)(0.5203) + 0.5664) = 0.5289
+
+```{r}
+# cart01_model$cptable
+cart02_model <- prune(cart01_model, cp = 0.015)
+
+rpart.plot(cart02_model)
+
+ypred <- predict(object = cart02_model, newdata = std_test, type = "prob")
+predicted_classes <- ifelse(ypred[, 2] > 0.3, 1, 0)
+
+# Contingency Table
+
+t2 <- table(std_test$Bitcoin_Price_Change, predicted_classes)
+row.names(t2) <- c("Actual: Decrease", "Actual: Increase")
+colnames(t2) <- c("Predicted: Decrease", "Predicted: Increase")
+t2 <- addmargins(A = t2, FUN = list(Total = sum), quiet = TRUE)
+t2
+
+# Node counts
+
+total_nodes <- length(cart02_model$frame$var)
+total_nodes
+leaf_nodes <- sum(cart02_model$frame$var == "<leaf>")
+leaf_nodes
+decision_nodes <- total_nodes - leaf_nodes
+decision_nodes
+
+# CART AUC score
+
+cart02_actual <- (std_test$Bitcoin_Price_Change == "Increased")
+cart02_roc <- roc(cart02_actual, predicted_classes)
+cart02_auc <- auc(cart02_roc)
+cart02_auc
+```
+
+## Random Forests
+
+Accuracy: (41 + 92)/246 = 0.5407
+Error Rate: 1 - 0.4919 = 0.4593
+Sensitivity: 92/113 = 0.8142
+Specificity: 41/133 = 0.3083
+Precision: 92/184 = 0.4457
+F1: (2)(0.4457)(0.8142)/(0.4457 + 0.8142) = 0.5761
+F2: (5)(0.4457)(0.8142)/((4)(0.4457) + 0.8142) = 0.6987
+F0.5: (1.25)(0.4457)(0.8142)/((0.25)(0.4457) + 0.8142) = 0.4901
+
+```{r}
+set.seed(35)
+rf01_model <- randomForest(formula = Bitcoin_Price_Change ~ Apple_Price + Tesla_Price + Microsoft_Price + Google_Price + Nvidia_Price + Berkshire_Price + Netflix_Price + Amazon_Price + Meta_Price, data = std_train, method = "class")
+
+ypred <- predict(object = rf01_model, newdata = std_test, type = "class")
+
+# Contingency Table
+
+t1 <- table(std_test$Bitcoin_Price_Change, ypred)
+row.names(t1) <- c("Actual: Decrease", "Actual: Increase")
+colnames(t1) <- c("Predicted: Decrease", "Predicted: Increase")
+t1 <- addmargins(A = t1, FUN = list(Total = sum), quiet = TRUE)
+t1
+
+rf01_model$ntree
+
+# RF AUC score
+
+rf01_roc <- roc(std_test$Bitcoin_Price_Change, as.numeric(ypred))
+rf01_auc <- auc(rf01_roc)
+rf01_auc
+```
+
+## Random Forests with 1000 ntree
+
+```{r}
+set.seed(35)
+rf02_model <- randomForest(formula = Bitcoin_Price_Change ~ Apple_Price + Tesla_Price + Microsoft_Price + Google_Price + Nvidia_Price + Berkshire_Price + Netflix_Price + Amazon_Price + Meta_Price, data = std_train, method = "class", ntree = 1000)
+
+ypred <- predict(object = rf02_model, newdata = std_test, type = "class")
+
+# Contingency Table
+
+t2 <- table(std_test$Bitcoin_Price_Change, ypred)
+row.names(t2) <- c("Actual: Decrease", "Actual: Increase")
+colnames(t2) <- c("Predicted: Decrease", "Predicted: Increase")
+t2 <- addmargins(A = t2, FUN = list(Total = sum), quiet = TRUE)
+t2
+
+rf02_model$ntree
+
+# RF AUC score
+
+rf02_roc <- roc(std_test$Bitcoin_Price_Change, as.numeric(ypred))
+rf02_auc <- auc(rf02_roc)
+rf02_auc
+```
+
+## Random Forests with 100 ntree
+
+```{r}
+set.seed(35)
+rf03_model <- randomForest(formula = Bitcoin_Price_Change ~ Apple_Price + Tesla_Price + Microsoft_Price + Google_Price + Nvidia_Price + Berkshire_Price + Netflix_Price + Amazon_Price + Meta_Price, data = std_train, method = "class", ntree = 100)
+
+ypred <- predict(object = rf03_model, newdata = std_test, type = "class")
+
+# Contingency Table
+
+t3 <- table(std_test$Bitcoin_Price_Change, ypred)
+row.names(t3) <- c("Actual: Decrease", "Actual: Increase")
+colnames(t3) <- c("Predicted: Decrease", "Predicted: Increase")
+t3 <- addmargins(A = t3, FUN = list(Total = sum), quiet = TRUE)
+t3
+
+rf03_model$ntree
+
+# RF AUC score
+
+rf03_roc <- roc(std_test$Bitcoin_Price_Change, as.numeric(ypred))
+rf03_auc <- auc(rf03_roc)
+rf03_auc
+```
+
+## C5.0
+
+```{r}
+c5_model <- C5.0(formula = Bitcoin_Price_Change ~ Apple_Price + Tesla_Price + Microsoft_Price + Google_Price + Nvidia_Price + Berkshire_Price + Netflix_Price + Amazon_Price + Meta_Price, data = std_train, methond = "class")
+
+plot(c5_model)
+
+ypred <- predict(object = c5_model, newdata = std_test, type = "class")
+
+t1 <- table(std_test$Bitcoin_Price_Change, ypred)
+row.names(t1) <- c("Actual: Decrease", "Actual: Increase")
+colnames(t1) <- c("Predicted: Decrease", "Predicted: Increase")
+t1 <- addmargins(A = t1, FUN = list(Total = sum), quiet = TRUE)
+t1
+```
+
+## Neural Networks
+
+```{r}
+set.seed(35)
+nnet01_model <- nnet(formula = Bitcoin_Price_Change ~ Apple_Price + Tesla_Price + 
+                     Microsoft_Price + Google_Price + Nvidia_Price + Berkshire_Price + 
+                     Netflix_Price + Amazon_Price + Meta_Price, data = std_train, size = 1)
+
+plotnet(nnet01_model)
+
+ypred <- predict(object = nnet01_model, newdata = std_test, type = "class")
+
+t1 <- table(std_test$Bitcoin_Price_Change, ypred)
+row.names(t1) <- c("Actual: Decrease", "Actual: Increase")
+colnames(t1) <- c("Predicted: Decrease", "Predicted: Increase")
+t1 <- addmargins(A = t1, FUN = list(Total = sum), quiet = TRUE)
+t1
+```
+
+## Naive Bayes
+
+```{r}
+# Train the Naive Bayes model
+nb_model <- naiveBayes(Bitcoin_Price_Change ~ Apple_Price + Tesla_Price + Microsoft_Price + Google_Price + Nvidia_Price + Berkshire_Price + Netflix_Price + Amazon_Price + Meta_Price, data = std_train)
+
+# Predict on the test set
+nb_predictions_prob <- predict(nb_model, newdata = std_test, type = "raw")
+nb_predictions <- ifelse(nb_predictions_prob[, "Increased"] >= 0.9, "Increased", "Decreased")
+
+# Confusion matrix
+conf_matrix <- table(std_test$Bitcoin_Price_Change, nb_predictions)
+
+# Add proper row and column names
+row.names(conf_matrix) <- c("Actual: Decrease", "Actual: Increase")
+colnames(conf_matrix) <- c("Predicted: Decrease", "Predicted: Increase")
+
+# Print the confusion matrix
+print(conf_matrix)
+```
